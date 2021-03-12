@@ -70,6 +70,9 @@ use std::sync::Mutex;
 use take_mut::take;
 // }}}
 
+/// This is the key given to the logger to filter based on pid.
+pub const PID_KEY: &'static str = "pid";
+
 /// Allows the user to enable/disable logs for processes
 pub struct PIDLogControl(Sender<AsyncMsg>);
 
@@ -92,17 +95,34 @@ impl PIDLogControl {
 }
 
 // {{{ Serializer
+
+/// Serialize a KV to find PID value.
+struct PidSerializer {
+    pid: Option<usize>,
+}
+
+impl Serializer for PidSerializer {
+    fn emit_arguments(
+        &mut self,
+        key: Key,
+        val: &fmt::Arguments,
+    ) -> slog::Result {
+        if key == PID_KEY {
+            if let Ok(id) = format!("{}", val).parse::<usize>() {
+                self.pid = Some(id);
+            }
+        }
+        Ok(())
+    }
+}
+
 struct ToSendSerializer {
     kv: Box<dyn KV + Send>,
-    pid: Option<usize>,
 }
 
 impl ToSendSerializer {
     fn new() -> Self {
-        ToSendSerializer {
-            kv: Box::new(()),
-            pid: None,
-        }
+        ToSendSerializer { kv: Box::new(()) }
     }
 
     fn finish(self) -> Box<dyn KV + Send> {
@@ -169,9 +189,6 @@ impl Serializer for ToSendSerializer {
         Ok(())
     }
     fn emit_usize(&mut self, key: Key, val: usize) -> slog::Result {
-        if key == "pid" {
-            self.pid = Some(val);
-        }
         take(&mut self.kv, |kv| Box::new((kv, SingleKV(key, val))));
         Ok(())
     }
@@ -512,13 +529,19 @@ impl AsyncRecord {
             .serialize(record, &mut ser)
             .expect("`ToSendSerializer` can't fail");
 
+        // Search for a PID
+        let mut pid = PidSerializer { pid: None };
+        logger_values
+            .serialize(record, &mut pid)
+            .expect("Cannot fail");
+
         AsyncRecord {
             msg: fmt::format(*record.msg()),
             level: record.level(),
             location: Box::new(*record.location()),
             tag: String::from(record.tag()),
             logger_values: logger_values.clone(),
-            pid: ser.pid,
+            pid: pid.pid,
             kv: ser.finish(),
         }
     }
