@@ -60,7 +60,6 @@ use slog::{BorrowedKV, Level, Record, RecordStatic, SingleKV, KV};
 use slog::{Key, OwnedKVList, Serializer};
 
 use slog::Drain;
-use std::error::Error;
 use std::fmt;
 use std::sync;
 use std::{io, thread};
@@ -71,7 +70,26 @@ use std::sync::Mutex;
 use take_mut::take;
 // }}}
 
-pub type LogSender = corssbeam_channel::Sender<AsyncMsg>;
+/// Allows the user to enable/disable logs for processes
+pub struct PIDLogControl(Sender<AsyncMsg>);
+
+impl PIDLogControl {
+    fn new(sender: Sender<AsyncMsg>) -> Self {
+        PIDLogControl(sender)
+    }
+
+    /// Disables emitting logs for a specific PID.
+    pub fn disable(&self, pid: usize) -> Result<(), ()> {
+        // blocking task
+        self.0.send(AsyncMsg::DisablePID(pid)).map_err(|_| ())
+    }
+
+    /// Enables emitting logs for a specific PID.
+    pub fn enable(&self, pid: usize) -> Result<(), ()> {
+        // blocking task
+        self.0.send(AsyncMsg::EnablePID(pid)).map_err(|_| ())
+    }
+}
 
 // {{{ Serializer
 struct ToSendSerializer {
@@ -81,7 +99,10 @@ struct ToSendSerializer {
 
 impl ToSendSerializer {
     fn new() -> Self {
-        ToSendSerializer { kv: Box::new(()) }
+        ToSendSerializer {
+            kv: Box::new(()),
+            pid: None,
+        }
     }
 
     fn finish(self) -> Box<dyn KV + Send> {
@@ -148,7 +169,7 @@ impl Serializer for ToSendSerializer {
         Ok(())
     }
     fn emit_usize(&mut self, key: Key, val: usize) -> slog::Result {
-        if key.as_str() == "pid" {
+        if key == "pid" {
             self.pid = Some(val);
         }
         take(&mut self.kv, |kv| Box::new((kv, SingleKV(key, val))));
@@ -216,7 +237,7 @@ impl<T> From<std::sync::PoisonError<T>> for AsyncError {
     fn from(err: std::sync::PoisonError<T>) -> AsyncError {
         AsyncError::Fatal(Box::new(io::Error::new(
             io::ErrorKind::BrokenPipe,
-            err.description(),
+            err.to_string(),
         )))
     }
 }
@@ -289,20 +310,24 @@ where
         let drain = self.drain;
         let join = builder
             .spawn(move || {
-                let mut enabled_pids = HashSet::new();
+                let mut enabled_pids = std::collections::HashSet::new();
                 loop {
                     match rx.recv().unwrap() {
                         AsyncMsg::Record(r) => {
                             if let Some(pid) = r.pid {
-                                if enabled_pids.contains(pid) {
+                                if enabled_pids.contains(&pid) {
                                     r.log_to(&drain).unwrap();
                                 }
                             } else {
                                 r.log_to(&drain).unwrap();
                             }
                         }
-                        AsyncMsg::EnablePID(pid) => enabled_pids.insert(pid),
-                        AsyncMsg::DisablePID(pid) => enabled_pids.remove(pid),
+                        AsyncMsg::EnablePID(pid) => {
+                            enabled_pids.insert(pid);
+                        }
+                        AsyncMsg::DisablePID(pid) => {
+                            enabled_pids.remove(&pid);
+                        }
                         AsyncMsg::Finish => return,
                     }
                 }
@@ -678,14 +703,15 @@ where
     }
 
     /// Complete building `Async` with PID channel
-    pub fn build_with_channel(self) -> (Async, Sender<AsyncMsg>) {
-        let sender = self.core.sender.clone();
+    pub fn build_with_channel(self) -> (Async, PIDLogControl) {
         let async_struct = Async {
             core: self.core.build_no_guard(),
             dropped: AtomicUsize::new(0),
             inc_dropped: self.inc_dropped,
         };
-        (async_struct, sender)
+        let log_control =
+            PIDLogControl::new(async_struct.core.ref_sender.clone());
+        (async_struct, log_control)
     }
 
     /// Complete building `Async` with `AsyncGuard`
