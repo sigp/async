@@ -71,9 +71,12 @@ use std::sync::Mutex;
 use take_mut::take;
 // }}}
 
+pub type LogSender = corssbeam_channel::Sender<AsyncMsg>;
+
 // {{{ Serializer
 struct ToSendSerializer {
     kv: Box<dyn KV + Send>,
+    pid: Option<usize>,
 }
 
 impl ToSendSerializer {
@@ -145,6 +148,9 @@ impl Serializer for ToSendSerializer {
         Ok(())
     }
     fn emit_usize(&mut self, key: Key, val: usize) -> slog::Result {
+        if key.as_str() == "pid" {
+            self.pid = Some(val);
+        }
         take(&mut self.kv, |kv| Box::new((kv, SingleKV(key, val))));
         Ok(())
     }
@@ -282,12 +288,23 @@ where
         }
         let drain = self.drain;
         let join = builder
-            .spawn(move || loop {
-                match rx.recv().unwrap() {
-                    AsyncMsg::Record(r) => {
-                        r.log_to(&drain).unwrap();
+            .spawn(move || {
+                let mut enabled_pids = HashSet::new();
+                loop {
+                    match rx.recv().unwrap() {
+                        AsyncMsg::Record(r) => {
+                            if let Some(pid) = r.pid {
+                                if enabled_pids.contains(pid) {
+                                    r.log_to(&drain).unwrap();
+                                }
+                            } else {
+                                r.log_to(&drain).unwrap();
+                            }
+                        }
+                        AsyncMsg::EnablePID(pid) => enabled_pids.insert(pid),
+                        AsyncMsg::DisablePID(pid) => enabled_pids.remove(pid),
+                        AsyncMsg::Finish => return,
                     }
-                    AsyncMsg::Finish => return,
                 }
             })
             .unwrap();
@@ -458,6 +475,7 @@ pub struct AsyncRecord {
     tag: String,
     logger_values: OwnedKVList,
     kv: Box<dyn KV + Send>,
+    pid: Option<usize>,
 }
 
 impl AsyncRecord {
@@ -475,6 +493,7 @@ impl AsyncRecord {
             location: Box::new(*record.location()),
             tag: String::from(record.tag()),
             logger_values: logger_values.clone(),
+            pid: ser.pid,
             kv: ser.finish(),
         }
     }
@@ -518,6 +537,10 @@ impl AsyncRecord {
 
 enum AsyncMsg {
     Record(AsyncRecord),
+    // Disables a PID,
+    DisablePID(usize),
+    // Enables a PID,
+    EnablePID(usize),
     Finish,
 }
 
@@ -654,6 +677,17 @@ where
         }
     }
 
+    /// Complete building `Async` with PID channel
+    pub fn build_with_channel(self) -> (Async, Sender<AsyncMsg>) {
+        let sender = self.core.sender.clone();
+        let async_struct = Async {
+            core: self.core.build_no_guard(),
+            dropped: AtomicUsize::new(0),
+            inc_dropped: self.inc_dropped,
+        };
+        (async_struct, sender)
+    }
+
     /// Complete building `Async` with `AsyncGuard`
     ///
     /// See `AsyncGuard` for more information.
@@ -780,7 +814,6 @@ impl Drop for Async {
 
 // }}}
 
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -789,16 +822,21 @@ mod test {
     #[test]
     fn integration_test() {
         let (mock_drain, mock_drain_rx) = MockDrain::new();
-        let async_drain = AsyncBuilder::new(mock_drain)
-            .build();
-        let slog = slog::Logger::root(async_drain.fuse(), o!("field1" => "value1"));
+        let async_drain = AsyncBuilder::new(mock_drain).build();
+        let slog =
+            slog::Logger::root(async_drain.fuse(), o!("field1" => "value1"));
 
         info!(slog, "Message 1"; "field2" => "value2");
         warn!(slog, "Message 2"; "field3" => "value3");
-        assert_eq!(mock_drain_rx.recv().unwrap(), r#"INFO Message 1: [("field1", "value1"), ("field2", "value2")]"#);
-        assert_eq!(mock_drain_rx.recv().unwrap(), r#"WARN Message 2: [("field1", "value1"), ("field3", "value3")]"#);
+        assert_eq!(
+            mock_drain_rx.recv().unwrap(),
+            r#"INFO Message 1: [("field1", "value1"), ("field2", "value2")]"#
+        );
+        assert_eq!(
+            mock_drain_rx.recv().unwrap(),
+            r#"WARN Message 2: [("field1", "value1"), ("field3", "value3")]"#
+        );
     }
-
 
     /// Test-helper drain
     #[derive(Debug)]
@@ -817,7 +855,11 @@ mod test {
         type Ok = ();
         type Err = slog::Never;
 
-        fn log(&self, record: &Record, logger_kv: &OwnedKVList) -> Result<Self::Ok, Self::Err> {
+        fn log(
+            &self,
+            record: &Record,
+            logger_kv: &OwnedKVList,
+        ) -> Result<Self::Ok, Self::Err> {
             let mut serializer = MockSerializer::default();
             logger_kv.serialize(record, &mut serializer).unwrap();
             record.kv().serialize(record, &mut serializer).unwrap();
@@ -835,7 +877,11 @@ mod test {
     }
 
     impl slog::Serializer for MockSerializer {
-        fn emit_arguments(&mut self, key: Key, val: &fmt::Arguments) -> Result<(), slog::Error> {
+        fn emit_arguments(
+            &mut self,
+            key: Key,
+            val: &fmt::Arguments,
+        ) -> Result<(), slog::Error> {
             self.kvs.push((key.to_string(), val.to_string()));
             Ok(())
         }
