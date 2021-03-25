@@ -92,6 +92,11 @@ impl PIDLogControl {
         // blocking task
         self.0.send(AsyncMsg::EnablePID(pid)).map_err(|_| ())
     }
+
+    /// Sets the emitted log level
+    pub fn log_level(&self, level: slog::Level) -> Result<(), ()> {
+        self.0.send(AsyncMsg::LogLevel(level)).map_err(|_| ())
+    }
 }
 
 // {{{ Serializer
@@ -328,15 +333,20 @@ where
         let join = builder
             .spawn(move || {
                 let mut enabled_pids = std::collections::HashSet::new();
+                let mut emit_log_level = None;
                 loop {
                     match rx.recv().unwrap() {
                         AsyncMsg::Record(r) => {
                             if let Some(pid) = r.pid {
-                                if enabled_pids.contains(&pid) {
+                                if !enabled_pids.contains(&pid) {
+                                    continue;
+                                }
+                            }
+                            // This is a log we want to process, if its level is sufficiently high
+                            if let Some(level) = emit_log_level {
+                                if r.level <= level {
                                     r.log_to(&drain).unwrap();
                                 }
-                            } else {
-                                r.log_to(&drain).unwrap();
                             }
                         }
                         AsyncMsg::EnablePID(pid) => {
@@ -344,6 +354,9 @@ where
                         }
                         AsyncMsg::DisablePID(pid) => {
                             enabled_pids.remove(&pid);
+                        }
+                        AsyncMsg::LogLevel(level) => {
+                            emit_log_level = Some(level);
                         }
                         AsyncMsg::Finish => return,
                     }
@@ -585,10 +598,13 @@ impl AsyncRecord {
 
 enum AsyncMsg {
     Record(AsyncRecord),
-    // Disables a PID,
+    // Disables a PID.
     DisablePID(usize),
-    // Enables a PID,
+    // Enables a PID.
     EnablePID(usize),
+    // Sets the emitted log level
+    LogLevel(slog::Level),
+    // Ends the task
     Finish,
 }
 
